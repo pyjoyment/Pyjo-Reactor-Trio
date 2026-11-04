@@ -61,6 +61,18 @@ with subtest('hello_world_trio.py'), tempfile.TemporaryDirectory() as dir:
     is_ok(process.returncode, 0, 'stopped by INT')
     like_ok(output, rf'Web application available at http://127\.0\.0\.1:{port}', 'listening')
 
+with subtest('trio_nursery.py'):
+    result = subprocess.run(
+        [sys.executable, os.path.join(EXAMPLES, 'trio_nursery.py')], capture_output=True, text=True, timeout=60
+    )
+    is_ok(
+        result.stdout,
+        'trio: HTTP/1.1 200 OK\nPyjo.UserAgent: 200 Your Pyjo is working!\n',
+        'a stream of Trio and the user agent of Pyjoyment in the run of Trio of the program',
+    )
+    is_ok(result.stderr, '', 'nothing on the standard error')
+    is_ok(result.returncode, 0, 'the server and the user agent closed at the end')
+
 # As the workflow Build runs it with the wheel: its server listens on a port that the system picks, so it needs no free
 # port of the tests
 with subtest('loopback_trio.py'):

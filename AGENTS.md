@@ -14,28 +14,94 @@ what each of their loops needed.
 
 ## How it works
 
-The reactor is not implemented yet: the module is the stub of the template,
-whose constructor raises `NotImplementedError`, so that nothing falls back to
-`Pyjo.Reactor.Poll` in the meantime. What it is to be:
+What the reactor is for is the servers of Pyjoyment, `daemon`, `prefork` and
+`prethread`, and its user agent, in a program of Trio, along with its tasks.
+The docstring of the module says what a user sees; this is how and why.
 
-- A class of its own on `Pyjo.Reactor.Poll`, as `Pyjo.Reactor.Twisted` is.
-  Trio has no callbacks of I/O or timers: a handle is watched by a task that
-  waits for it with `trio.lowlevel.wait_readable` and `wait_writable`, and a
-  timer by a task that sleeps, in a nursery of the reactor, whose cancel
-  scopes remove and change them.
-- What the reactor is for is the servers of Pyjoyment, `daemon`, `prefork` and
-  `prethread`, and its user agent, in a program of Trio, along with its tasks.
-- What is to be found out and written down here: how `start`, `stop` and
-  `one_tick` run Trio, as a run of `trio.run` of its own, in the guest mode of
-  `trio.lowlevel.start_guest_run`, or in the run of the application that is
-  running already, as `Pyjo.Reactor.Twisted` does with a reactor of Twisted
-  that runs; `one_tick` in a library whose run cannot be entered again; the
-  threads of `Pyjo.Server.Prethread`, each with a run of its own; the child of
-  a fork, as a worker of `Pyjo.Server.Prefork`; the signals and the wakeup fd
-  of the signals, which Trio sets in its run and a worker of
-  `Pyjo.Server.Prefork` sets too, as uvloop did; a handle closed while a task
-  waits for it, which Trio requires `trio.lowlevel.notify_closing` for; and
-  what differs from `Pyjo.Reactor.Poll` in the order of the events.
+- **A class on `Pyjo.Reactor.Poll`**, as `Pyjo.Reactor.Twisted` is, for the
+  bookkeeping: `_io` with the modes, `_timers` with their `time`, `again`,
+  `_timer`, `next_tick` and `_try`. Trio has no callbacks of I/O or timers.
+- **Watchers and the ticker.** Each handle is watched by a system task per
+  direction, `_watcher`, which waits with `trio.lowlevel.wait_readable` or
+  `wait_writable` in a cancel scope of its own, and does not call the callback:
+  it reports the handle to `_ready` and waits for the end of the round, as the
+  handle stays ready until the callback reads or writes. One system task per
+  reactor, `_tick`, sleeps until a watcher reports or the first timer is due,
+  in a cancel scope whose deadline is that timer, and runs a round,
+  `_dispatch`, as a tick of `Pyjo.Reactor.Poll`: the handles that are ready, in
+  the order in which they were added, and then the timers that are due, with
+  the `next_tick` of the handles among them. Timers are no tasks.
+- **Why rounds.** Trio shuffles the tasks of a batch, reversing it half of the
+  time, so a callback per watcher task ran in a random order, where Poll has
+  the order of `_io` and runs the timers after the handles. Tests of
+  Pyjoyment depend on it: a listen socket of `single_accept` accepted a second
+  connection before the `next_tick` of the first one (Connection limit), and a
+  worker of `Pyjo.Server.Prethread` read the byte of its graceful stop before
+  it accepted the connection waiting in the backlog, and stopped without the
+  request that was to keep it (4 of 10 runs on Linux). `_order` numbers the
+  handles at their first `io`, which `_dispatch` sorts the ready ones by.
+- **Two kinds of run.** Inside a run of Trio, `trio.lowlevel.in_trio_run()`,
+  `_bind` attaches the reactor to it (`_Run(own=False)`) and spawns its tasks
+  there; `is_running` is true, so `Pyjo.Promise.wait` returns at once and a
+  blocking request raises, as on `Pyjo.Reactor.Asyncio` in a running loop since
+  pyjoyment/Pyjoyment#522, and `start` and `one_tick` return. Outside, `_own`
+  starts a guest run, `trio.lowlevel.start_guest_run`, whose host loop is a
+  `queue.SimpleQueue` that `_pump` takes the guest ticks from, until its
+  condition. The guest run ends when `start` or `one_tick` returns (`_end`),
+  unless `run_coroutine` tasks are not done, which keep it until they are, or
+  until `close` cancels its main task. A run per `start` would cost an empty
+  `trio.run` each time, about 184 µs, where a guest tick costs about 6 to 12 µs
+  per event, and `trio.run` takes over `signal.set_wakeup_fd`.
+- **The gate.** A guest tick runs the batches of Trio until Trio has to wait
+  for I/O, so one tick can hold several rounds: a round after `stop`, or after
+  the event of `one_tick`, fired callbacks that Poll would not (a second
+  `drain` of a stream, three errors of a disabled SOCKS instead of one). In the
+  own run, the ticker waits at `_gate` while `_halted`: when no pump runs, or
+  the condition of the pump holds already. The run of the application has no
+  gate: it is always running.
+- **Watcher removed before it started.** `remove` and `io` of the same handle
+  in one tick, as `_not_accepting()._maybe_accepting()` of `Pyjo.IOLoop` does,
+  cancel a watcher that has not run yet. Trio checks its registry before it
+  delivers the cancellation, so that watcher raised `BusyResourceError`
+  against the new one, when Trio ran it second; it returns when its scope is
+  cancelled already.
+- **Closed handles and `notify_closing`.** The reactor does not call
+  `trio.lowlevel.notify_closing`: Pyjoyment removes a handle before it closes
+  it, and the cancellation of the watcher unregisters it at once. A handle
+  that is closed while it is watched leaves its watcher registered in Trio
+  under its number: the next handle of that number in the same reactor is
+  fine, as `io` cancels the old watcher first, but in another one Trio raises
+  `BusyResourceError`. A reactor that is gone in a run of the application has a
+  finalizer, `_abandon`, which cancels its tasks with `run_sync_soon`, as the
+  garbage collector may run in another thread. `wait_readable` of a closed
+  handle raises `OSError`, which the watcher reports as ready, as poll reports
+  `POLLNVAL`, so that the callback finds out.
+- **Signals.** The guest run has `host_uses_signal_set_wakeup_fd=True`, so it
+  leaves `signal.set_wakeup_fd` to the program, which the servers of Pyjoyment
+  set for themselves. A signal handler runs in the middle of Trio, so it must
+  not change its state: `next_tick` from a handler, as the servers stop, moves
+  the deadline of the ticker through `TrioToken.run_sync_soon`, which is
+  signal-safe (`_rearm`, `_deadline`), and the ticker copies `_timers` before
+  it looks for the first one, as Poll does.
+- **Errors.** An exception of a callback that no `error` event handles is
+  raised from `start` or `one_tick` of the own run (`_error`), and an error of
+  the guest run itself from its outcome. In the run of the application, it
+  crashes the system task, and Trio ends the run with `TrioInternalError`.
+- **Threads.** The run is thread-local in Trio, so each thread has runs of its
+  own, as the workers of `Pyjo.Server.Prethread`. The idle threads of the
+  cache of Trio are shared by them.
+- **Fork, with private API of Trio.** The child of a fork, as a worker of
+  `Pyjo.Server.Prefork`, leaves the run of the parent: its epoll is shared with
+  the parent and its thread of I/O is not there. A fork in the middle of a
+  guest tick, as `Pyjo.IOLoop.subprocess` does in a callback, leaves the run
+  bound to the thread, so `_after_fork_in_child` deletes `runner` and `task`
+  of `trio._core._run.GLOBAL_RUN_CONTEXT`. Before a fork, `_before_fork` stops
+  the idle threads of `trio._core._thread_cache`, as the one that waits for
+  the I/O of a guest run waits 10 seconds for its next job, and Python warns
+  about a fork of a process with threads, which `t/stdlib/IOLoop_Subprocess.py`
+  of Pyjoyment fails on: each gets an empty job with `IDLE_TIMEOUT` 0, so its
+  next wait times out at once, and is joined. Trio has no API for either, so
+  both break if Trio renames them.
 - Trio is pure Python, on CPython and PyPy, so the matrix of Tests has 3.12 to
   3.15, the free-threaded build and PyPy, as the one of Pyjo-Reactor-Twisted.
 
@@ -134,14 +200,13 @@ Pyjoyment of `uv.lock`:
 mise exec -- uv run --group docs --with-editable ../Pyjoyment sphinx-build -W --keep-going -b html docs docs/_build/html
 ```
 
-`t/Reactor_Trio.py` is to be `t/Pyjo/Reactor_Poll.py` of Pyjoyment, the port
-of `t/mojo/reactor_poll.t` of Mojolicious, in the subtests of 9.53, with
-subtests of its own for Trio, as `t/Reactor_Uvloop.py` of
-Pyjo-Reactor-Uvloop and `t/Reactor_Twisted.py` of Pyjo-Reactor-Twisted have
-them for their loops; it is a stub of the template now.
+`t/Reactor_Trio.py` is `t/Pyjo/Reactor_Poll.py` of Pyjoyment, the port of
+`t/mojo/reactor_poll.t` of Mojolicious, in the subtests of 9.53, without the
+abstract methods of `Mojo::Reactor`, as `t/Reactor_Twisted.py` of
+Pyjo-Reactor-Twisted, with subtests of its own for Trio after them, for the
+points of "How it works", which fail without what they test.
 `t/docs/Reactor_Trio.py` runs the synopsis of the module, in both forms, as
-`t/docs` of Pyjoyment does.
-
+`t/docs` of Pyjoyment does, and `t/examples.py` the examples.
 
 ## Releases
 

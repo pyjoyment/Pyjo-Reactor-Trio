@@ -33,6 +33,11 @@ docs = ["sphinx>=9.2.0"]
 [tool.uv.dependency-groups]
 docs = { requires-python = ">=3.14" }
 
+# Until the release of Pyjoyment after 0.2.0: is_running of a reactor on an event loop that does not nest, which the
+# freeze in the tests of Pyjoyment takes for the reactor of Trio (pyjoyment/Pyjoyment#522)
+[tool.uv.sources]
+pyjoyment = { git = "https://github.com/pyjoyment/Pyjoyment", branch = "main" }
+
 # Only the module: the packages Pyjo and Pyjo.Reactor are those of Pyjoyment, whose namespace extend_path keeps open
 [tool.hatch.build.targets.wheel]
 only-include = ["Pyjo/Reactor/Trio.py"]
