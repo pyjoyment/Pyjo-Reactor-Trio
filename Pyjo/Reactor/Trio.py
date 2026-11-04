@@ -144,6 +144,9 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
     :mod:`Pyjo.Reactor.Poll` and implements the following new ones.
     """
 
+    # Not in Mojolicious: Trio, whose code a finalizer of the garbage collector may interrupt
+    event_loop_modules = ('trio',)
+
     def __init__(self) -> None:
         """::
 
@@ -160,9 +163,10 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         self._error: BaseException | None = None
         self._finalizer: weakref.finalize[..., Any] | None = None
 
-        # The cancel scopes of the watchers of the handles, readable and writable, the order in which the handles were
+        # The watchers of the handles, readable and writable, the order in which the handles were
         # added, and the handles that the watchers found ready, 1 readable and 2 writable, for the next round
-        self._scopes: dict[int, list[trio.CancelScope | None]] = {}
+        self._watchers: dict[int, list[_Watcher | None]] = {}
+        self._stopping: dict[int, int] = {}
         self._order: dict[int, int] = {}
         self._sequence = 0
         self._ready: dict[int, int] = {}
@@ -318,7 +322,7 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
 
         Remove all handles and timers.
         """
-        for fd in list(self._scopes):
+        for fd in list(self._watchers):
             self._cancel(fd)
         self._events = {}
         self._io = {}
@@ -432,7 +436,7 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
     # own one, or none
     def _bind(self) -> _Run | None:
         run = self._run
-        if trio.lowlevel.in_trio_run():
+        if trio.lowlevel.in_trio_run() and not getattr(_STARTING, 'active', False):
             token = trio.lowlevel.current_trio_token()
             if run is not None and run.token is token and not run.done:
                 return run
@@ -446,10 +450,11 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         return run
 
     def _cancel(self, fd: int) -> None:
-        if (scopes := self._scopes.pop(fd, None)) is not None:
-            for scope in scopes:
-                if scope is not None:
-                    scope.cancel()
+        self._ready.pop(fd, None)
+        if (watchers := self._watchers.pop(fd, None)) is not None:
+            for watcher in watchers:
+                if watcher is not None:
+                    self._stop_watcher(fd, watcher)
 
     # A round of the events, as a tick of Pyjo.Reactor.Poll: the handles that are ready, in the order in which they were
     # added, as poll reports them, where Trio wakes their watchers in an order that it shuffles, then the timers that are
@@ -530,8 +535,9 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
     def _forget(self, run: _Run) -> None:
         if self._run is run:
             self._run = None
-        for scopes in self._scopes.values():
-            scopes[0] = scopes[1] = None
+        for watchers in list(self._watchers.values()):
+            watchers[0] = watchers[1] = None
+        self._stopping.clear()
         self._ready = {}
         self._ticker = self._signal = self._sleep = self._round = self._gate = None
 
@@ -550,9 +556,11 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         holder: list[_Run] = []
         ref = weakref.ref[Pyjo_Reactor_Trio](self)
 
+        # The scope of the main task is there before it starts, so that the end of a run that failed to start ends it
+        scope = trio.CancelScope()
+
         async def main() -> None:
-            with trio.CancelScope() as scope:
-                holder[0].main = scope
+            with scope:
                 await trio.sleep_forever()
 
         def done(result: outcome.Outcome[None]) -> None:
@@ -562,18 +570,24 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
                 reactor._forget(run)
 
         # The host loop is the queue of the pump, and the program keeps the wakeup fd of the signals, as the servers of
-        # Pyjoyment set it for themselves
-        trio.lowlevel.start_guest_run(
-            main,
-            run_sync_soon_threadsafe=q.put_nowait,
-            done_callback=done,
-            host_uses_signal_set_wakeup_fd=True,
-            strict_exception_groups=True,
-        )
-        run = self._run = _Run(trio.lowlevel.current_trio_token(), True)
-        run.queue = q
-        holder.append(run)
-        self._spawn(run)
+        # Pyjoyment set it for themselves. The run is bound to the thread before Trio has its system nursery, and before
+        # the reactor has the run, where a signal handler that adds a timer would take it for the run of the application
+        _STARTING.active = True
+        try:
+            trio.lowlevel.start_guest_run(
+                main,
+                run_sync_soon_threadsafe=q.put_nowait,
+                done_callback=done,
+                host_uses_signal_set_wakeup_fd=True,
+                strict_exception_groups=True,
+            )
+            run = self._run = _Run(trio.lowlevel.current_trio_token(), True)
+            run.queue = q
+            run.main = scope
+            holder.append(run)
+            self._spawn(run)
+        finally:
+            _STARTING.active = False
         return run
 
     # The own run, which runs its guest ticks from the queue until the condition, with the cleanups of the finalizers that
@@ -636,13 +650,16 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         self._signal = self._sleep = self._round = self._gate = None
         ticker = self._ticker = trio.CancelScope()
         trio.lowlevel.spawn_system_task(Pyjo_Reactor_Trio._tick, ref, ticker)
-        for fd, io in self._io.items():
-            self._scopes[fd] = [None, None]
+        # A finalizer that the garbage collector runs here may remove a handle
+        for fd in list(self._io):
+            if (io := self._io.get(fd)) is None:
+                continue
+            self._watchers[fd] = [None, None]
             self._watch(fd, io['mode'])
 
         if (finalizer := self._finalizer) is not None:
             finalizer.detach()
-        finalizer = self._finalizer = weakref.finalize(self, _abandon, run.token, ticker, self._scopes)
+        finalizer = self._finalizer = weakref.finalize(self, _abandon, run.token, ticker, self._watchers)
         finalizer.atexit = False
 
     def _step(self) -> None:
@@ -663,18 +680,57 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
                 pass
 
     def _watch(self, fd: int, mode: int) -> None:
-        scopes = self._scopes.setdefault(fd, [None, None])
+        watchers = self._watchers.setdefault(fd, [None, None])
         run = self._run
         for writable in (False, True):
             wanted = bool(mode & (_WRITABLE if writable else _READABLE))
-            scope = scopes[writable]
-            if wanted and scope is None and run is not None and not run.done:
-                scope = scopes[writable] = trio.CancelScope()
-                ref = weakref.ref[Pyjo_Reactor_Trio](self)
-                trio.lowlevel.spawn_system_task(Pyjo_Reactor_Trio._watcher, ref, fd, writable, scope)
-            elif not wanted and scope is not None:
-                scope.cancel()
-                scopes[writable] = None
+            watcher = watchers[writable]
+            if wanted and watcher is None and run is not None and not run.done:
+                watcher = watchers[writable] = _Watcher()
+                self._start_watcher(fd, writable, watcher)
+            elif not wanted and watcher is not None:
+                self._stop_watcher(fd, watcher)
+                watchers[writable] = None
+
+    # A watcher is stopped at once, so that it reports nothing more, as a handle of the same number may be added before its
+    # scope is cancelled. The scope is cancelled in a task of the run, where the thread of I/O of Trio does not wait.
+    # Elsewhere, as between the guest ticks of the own run, or in a finalizer that the garbage collector runs in the
+    # middle of Trio, it is cancelled at the next tick, as kqueue of Trio raises KeyError on an event of a watcher that
+    # was cancelled after its thread had it, which ends the run with TrioInternalError
+    def _stop_watcher(self, fd: int, watcher: '_Watcher') -> None:
+        watcher.stopped = True
+        scope = watcher.scope
+        if (run := self._run) is None or run.done or _in_task():
+            scope.cancel()
+            return
+
+        stopping = self._stopping
+        stopping[fd] = stopping.get(fd, 0) + 1
+
+        def stop() -> None:
+            scope.cancel()
+            if (n := stopping.get(fd, 0)) > 1:
+                stopping[fd] = n - 1
+            else:
+                stopping.pop(fd, None)
+
+        try:
+            run.token.run_sync_soon(stop)
+        except trio.RunFinishedError:
+            stop()
+
+    # A new watcher of a handle whose watcher is cancelled at the next tick starts after it, as Trio raises
+    # BusyResourceError for a second one
+    def _start_watcher(self, fd: int, writable: bool, watcher: '_Watcher') -> None:
+        ref = weakref.ref[Pyjo_Reactor_Trio](self)
+        args = (Pyjo_Reactor_Trio._watcher, ref, fd, writable, watcher)
+        if fd in self._stopping and (run := self._run) is not None:
+            try:
+                run.token.run_sync_soon(trio.lowlevel.spawn_system_task, *args)
+                return
+            except trio.RunFinishedError:
+                return
+        trio.lowlevel.spawn_system_task(*args)
 
     def _watching(self) -> bool:
         return bool(len(self._timers) or len(self._io) or len(self._tasks))
@@ -718,14 +774,14 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
     # The watcher of a handle, readable or writable, which waits for it, reports it to the ticker and waits for the end of
     # the round, as the handle stays ready until its callback reads or writes
     @staticmethod
-    async def _watcher(ref: 'weakref.ref[Pyjo_Reactor_Trio]', fd: int, writable: bool, scope: trio.CancelScope) -> None:
+    async def _watcher(ref: 'weakref.ref[Pyjo_Reactor_Trio]', fd: int, writable: bool, watcher: '_Watcher') -> None:
         wait = trio.lowlevel.wait_writable if writable else trio.lowlevel.wait_readable
         bit = _WRITABLE if writable else _READABLE
-        with scope:
+        with watcher.scope:
             while True:
                 # A watcher that was removed before it started, whose handle a new one may wait for already, which Trio
                 # checks before it delivers the cancellation
-                if scope.cancel_called:
+                if watcher.stopped:
                     return
 
                 # A handle that is closed is ready, as poll reports it, so that its callback finds out
@@ -734,7 +790,8 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
                 except (OSError, trio.ClosedResourceError):
                     pass
 
-                if (reactor := ref()) is None:
+                # Ready after it was removed, where a new handle may have its number
+                if watcher.stopped or (reactor := ref()) is None:
                     return
                 round = reactor._report(fd, bit)
                 del reactor
@@ -743,19 +800,36 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
 
 # The tasks of a reactor that is gone, in the thread of its run, which may have ended
 def _abandon(
-    token: trio.lowlevel.TrioToken, ticker: trio.CancelScope, scopes: dict[int, list[trio.CancelScope | None]]
+    token: trio.lowlevel.TrioToken, ticker: trio.CancelScope, watchers: 'dict[int, list[_Watcher | None]]'
 ) -> None:
     def cancel() -> None:
         ticker.cancel()
-        for watchers in scopes.values():
-            for scope in watchers:
-                if scope is not None:
-                    scope.cancel()
+        for pair in list(watchers.values()):
+            for watcher in pair:
+                if watcher is not None:
+                    watcher.scope.cancel()
 
     try:
         token.run_sync_soon(cancel)
     except trio.RunFinishedError:
         pass
+
+
+# The task of a watcher: its cancel scope, and whether it is stopped, which the cancellation of the scope may come after
+class _Watcher:
+    __slots__ = ('scope', 'stopped')
+
+    def __init__(self) -> None:
+        self.scope = trio.CancelScope()
+        self.stopped = False
+
+
+def _in_task() -> bool:
+    try:
+        trio.lowlevel.current_task()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _fileno(handle: Handle) -> int:
@@ -812,6 +886,9 @@ def _trio_time(when: float) -> float:
 
 
 _REACTORS: 'weakref.WeakSet[Pyjo_Reactor_Trio]' = weakref.WeakSet()
+
+# The thread starts an own run, which a reactor does not attach to as to the run of the application
+_STARTING = threading.local()
 
 
 # The idle threads of the cache of Trio, as the one that waits for the I/O of a guest run, are stopped before a fork, as

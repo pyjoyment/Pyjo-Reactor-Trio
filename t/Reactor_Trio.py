@@ -442,6 +442,56 @@ with subtest('next_tick from a signal handler'):
     ok(ticks, 'callbacks of the signal handler')
     reactor.reset()
 
+# Not in Mojolicious: a signal handler in the middle of the start of the own run, which Trio binds to the thread before it
+# has its system nursery, where the reactor would take it for the run of the application, as PyPy runs the handler of
+# the test above there; a trace function runs next_tick there, as the handler would
+with subtest('next_tick in the start of the own run'):
+    reactor = Pyjo.Reactor.Trio.new()
+    ticks = []
+
+    def trace(frame, event, arg):
+        if event == 'call' and frame.f_code.co_name == 'init' and 'trio' in frame.f_code.co_filename and not ticks:
+            ticks.append('init')
+            reactor.next_tick(lambda reactor: ticks.append('next_tick'))
+
+    reactor.timer(0.01, lambda reactor: None)
+    sys.settrace(trace)
+    try:
+        err = eval_(lambda: reactor.start())
+    finally:
+        sys.settrace(None)
+    is_ok(err, None, 'no error')
+    is_deeply_ok(ticks, ['init', 'next_tick'], 'callback of next_tick')
+    reactor.close()
+
+# A finalizer that the garbage collector runs while the run starts, as PyPy does, removes a handle
+with subtest('Handle removed in the start of the own run'):
+    reactor = Pyjo.Reactor.Trio.new()
+    first, first_peer = socket.socketpair()
+    second, second_peer = socket.socketpair()
+    second_peer.sendall(b'x')
+    got = []
+
+    def trace(frame, event, arg):
+        if event == 'call' and frame.f_code.co_name == '_watch' and not got:
+            got.append('remove')
+            reactor.remove(second)
+
+    reactor.io(first, lambda reactor, writable: got.append('first')).watch(first, True, False)
+    reactor.io(second, lambda reactor, writable: got.append('second')).watch(second, True, False)
+    reactor.timer(0.05, lambda reactor: reactor.stop())
+    sys.settrace(trace)
+    try:
+        err = eval_(lambda: reactor.start())
+    finally:
+        sys.settrace(None)
+    is_ok(err, None, 'no error')
+    is_deeply_ok(got, ['remove'], 'removed handle is not watched')
+    reactor.reset()
+    reactor.close()
+    for handle in (first, first_peer, second, second_peer):
+        handle.close()
+
 # Not in Mojolicious: the reactor in a run of Trio of the application, which watches its handles and timers with tasks of
 # its own, where start returns at once, and a callback runs in Trio
 with subtest('In a run of Trio'):
@@ -573,6 +623,50 @@ with subtest('Watcher removed before it started'):
     reactor.close()
     first.close()
     peer.close()
+
+with subtest('Watcher removed between the guest ticks'):
+    first, peer = socket.socketpair()
+    reactor = Pyjo.Reactor.Trio.new()
+    readable = 0
+
+    def readable_cb(reactor, writable):
+        global readable
+        readable += 1
+
+    reactor.run_coroutine(trio.sleep_forever(), lambda value: None, lambda reason: None)
+    reactor.io(first, readable_cb).watch(first, True, False)
+    reactor.timer(0.01, lambda reactor: None)
+    reactor.one_tick()
+
+    # The thread of I/O of Trio has the event, which the next guest tick takes from the queue
+    peer.sendall(b'x')
+    deadline = time.monotonic() + 5
+    while reactor._run.queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    ok(not reactor._run.queue.empty(), 'event is waiting')
+    reactor.remove(first)
+    reactor.timer(0.01, lambda reactor: None)
+    err = eval_(lambda: reactor.one_tick())
+    is_ok(err, None, 'no error')
+    is_ok(readable, 0, 'removed handle is not readable')
+    reactor.close()
+    first.close()
+    peer.close()
+
+with subtest('Finalizer in the frames of Trio'):
+    got = []
+
+    async def main():
+        reactor = Pyjo.Reactor.Trio.new()
+        reactor.timer(10, lambda reactor: None)
+        Pyjo.Reactor._finalize(lambda: got.append('cleanup'), reactor)
+        got.append('finalizer')
+        for _ in range(10):
+            await trio.sleep(0)
+        reactor.reset()
+
+    trio.run(main)
+    is_deeply_ok(got, ['finalizer', 'cleanup'], 'cleanup at the next tick')
 
 with subtest('Reactor gone in a run of Trio'):
     first, peer = socket.socketpair()

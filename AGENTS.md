@@ -65,6 +65,37 @@ The docstring of the module says what a user sees; this is how and why.
   delivers the cancellation, so that watcher raised `BusyResourceError`
   against the new one, when Trio ran it second; it returns when its scope is
   cancelled already.
+- **Watcher removed between the guest ticks.** Between the ticks of the own
+  run, the thread of I/O of Trio waits, and may have the event of a watcher
+  already. A watcher cancelled there, by the program between `one_tick`s, by
+  `_drain` in `_pump`, or by a finalizer that the garbage collector runs in the
+  middle of Trio, leaves that event without its registration, which kqueue of
+  Trio, on macOS and BSD, raises `KeyError` on, and the run ends with
+  `TrioInternalError` (`t/stdlib/IOLoop_gc.py` of Pyjoyment, 4 of 10 runs);
+  epoll keeps its registrations in a `defaultdict`. Outside a task of Trio,
+  `_stop_watcher` cancels it with `run_sync_soon`, at the next tick, after the
+  events, and `_start_watcher` starts a new watcher of that handle after it
+  (`_stopping`), as Trio would raise `BusyResourceError` for a second one.
+  Other watchers start at once, as the ones that `_own` starts must be there
+  before the first round. A watcher is stopped at once, `_Watcher.stopped`,
+  and reports nothing more, and its handle leaves `_ready`: until its scope is
+  cancelled, a handle of the same number may be added, as a new connection,
+  whose callback it woke up (`Socket is not connected` of
+  `t/docs/skills_async.py`, the inactivity timeouts of `t/Pyjo/App_ASGI.py`,
+  13 of 20 runs). The bug of Trio is to be reported upstream
+  (#2), and the workaround dropped when a release fixes it.
+- **Finalizers in the middle of the reactor.** `Pyjo.Reactor._finalize` defers
+  a cleanup to the next tick below a frame of this module, wherever it is
+  installed, and of Trio, which `event_loop_modules` names, since
+  pyjoyment/Pyjoyment#534. Before, it ran at once in the frames of the
+  reactor when it was installed editable, as in development and CI, and a
+  finalizer that PyPy ran in `_spawn` removed a handle in the middle of its
+  loop. The reactor still iterates over copies, as `remove` comes from a
+  callback too, `_spawn` skips a handle that is gone, and the main task of
+  the own run has its scope before it starts, so that `_end` ends a run that
+  failed to start. A cleanup that is deferred runs in `_drain` of `_pump`,
+  between the guest ticks, where the watcher that it removes is cancelled at
+  the next tick, as above.
 - **Closed handles and `notify_closing`.** The reactor does not call
   `trio.lowlevel.notify_closing`: Pyjoyment removes a handle before it closes
   it, and the cancellation of the watcher unregisters it at once. A handle
@@ -204,7 +235,8 @@ mise exec -- uv run --group docs --with-editable ../Pyjoyment sphinx-build -W --
 `t/mojo/reactor_poll.t` of Mojolicious, in the subtests of 9.53, without the
 abstract methods of `Mojo::Reactor`, as `t/Reactor_Twisted.py` of
 Pyjo-Reactor-Twisted, with subtests of its own for Trio after them, for the
-points of "How it works", which fail without what they test.
+points of "How it works", which fail without what they test; "Watcher removed
+between the guest ticks" fails on macOS only, where Trio has kqueue.
 `t/docs/Reactor_Trio.py` runs the synopsis of the module, in both forms, as
 `t/docs` of Pyjoyment does, and `t/examples.py` the examples.
 
