@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "Pyjo-Reactor-Trio"
-version = "0.2.0.dev1"
+version = "0.1.0.dev1"
 description = "Low level event reactor with Trio support for Pyjoyment."
 readme = "README.md"
 license = "Artistic-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Piotr Roszatycki", email = "piotr.roszatycki@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = ["Pyjoyment>=0.2.0", "trio>=0.35.0"]
+dependencies = ["Pyjoyment>=0.3.0", "trio>=0.35.0"]
 keywords = ["pyjoyment", "reactor", "trio", "structured concurrency"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -32,13 +32,6 @@ docs = ["sphinx>=9.2.0"]
 # of the distribution, which a new Sphinx may not support, as Sphinx 9.2 does not support 3.12
 [tool.uv.dependency-groups]
 docs = { requires-python = ">=3.14" }
-
-# Until the release of Pyjoyment after 0.2.0: is_running of a reactor on an event loop that does not nest, which the
-# freeze in the tests of Pyjoyment takes for the reactor of Trio (pyjoyment/Pyjoyment#522), and the async iterators of
-# Pyjo.Iterator closed after a break, which Trio warns about (pyjoyment/Pyjoyment#532), and event_loop_modules of a
-# reactor, below whose frames a finalizer defers its cleanup (pyjoyment/Pyjoyment#534)
-[tool.uv.sources]
-pyjoyment = { git = "https://github.com/pyjoyment/Pyjoyment", branch = "main" }
 
 # Only the module: the packages Pyjo and Pyjo.Reactor are those of Pyjoyment, whose namespace extend_path keeps open
 [tool.hatch.build.targets.wheel]
