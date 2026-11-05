@@ -83,4 +83,84 @@ with subtest('loopback_trio.py'):
     is_ok(result.stderr, '', 'nothing on the standard error')
     is_ok(result.returncode, 0, 'the server and the user agent closed at the end')
 
+
+# The lines of each task, by the name before the colon, as the tasks and the callbacks of Pyjoyment run concurrently, in
+# an order of their lines that differs between the runs
+def lines_of(output):
+    lines = {}
+    for line in output.splitlines():
+        lines.setdefault(line.split(':')[0], []).append(line)
+    return lines
+
+
+with subtest('echo_client_trio.py'):
+    result = subprocess.run(
+        [sys.executable, os.path.join(EXAMPLES, 'echo_client_trio.py')], capture_output=True, text=True, timeout=60
+    )
+    lines = lines_of(result.stdout)
+    is_ok(sorted(lines), ['echo_server 0', 'parent', 'receiver', 'sender'], 'the lines of the tasks')
+    like_ok(lines['parent'][0], r'^parent: connecting to 127\.0\.0\.1:\d+$', 'the client connects')
+    is_ok(lines['parent'][1:], ['parent: spawning sender...', 'parent: spawning receiver...'], 'the client spawns')
+    is_ok(
+        lines['sender'],
+        [
+            'sender: started!',
+            "sender: sending b'async can sometimes be confusing,'",
+            "sender: sending b'but I believe in you!'",
+        ],
+        'the sender of Trio',
+    )
+    is_ok(
+        lines['receiver'],
+        [
+            'receiver: started!',
+            "receiver: got data b'async can sometimes be confusing,'",
+            "receiver: got data b'but I believe in you!'",
+            'receiver: connection closed',
+        ],
+        'the receiver of Trio',
+    )
+    is_ok(
+        lines['echo_server 0'],
+        [
+            'echo_server 0: started',
+            "echo_server 0: received data b'async can sometimes be confusing,'",
+            "echo_server 0: received data b'but I believe in you!'",
+            'echo_server 0: connection closed',
+        ],
+        'the echo server of Pyjoyment',
+    )
+    is_ok(result.stderr, '', 'nothing on the standard error')
+    is_ok(result.returncode, 0, 'the server and the client closed at the end')
+
+with subtest('echo_server_trio.py'):
+    result = subprocess.run(
+        [sys.executable, os.path.join(EXAMPLES, 'echo_server_trio.py')], capture_output=True, text=True, timeout=60
+    )
+    lines = lines_of(result.stdout)
+    is_ok(sorted(lines), ['client', 'echo_server 0'], 'the lines of the tasks')
+    is_ok(
+        lines['client'],
+        [
+            "client: sending b'async can sometimes be confusing,'",
+            "client: got data b'async can sometimes be confusing,'",
+            "client: sending b'but I believe in you!'",
+            "client: got data b'but I believe in you!'",
+            'client: connection closed',
+        ],
+        'the echo client of Pyjoyment',
+    )
+    is_ok(
+        lines['echo_server 0'],
+        [
+            'echo_server 0: started',
+            "echo_server 0: received data b'async can sometimes be confusing,'",
+            "echo_server 0: received data b'but I believe in you!'",
+            'echo_server 0: connection closed',
+        ],
+        'the echo server of Trio',
+    )
+    is_ok(result.stderr, '', 'nothing on the standard error')
+    is_ok(result.returncode, 0, 'the server and the client closed at the end')
+
 done_testing()

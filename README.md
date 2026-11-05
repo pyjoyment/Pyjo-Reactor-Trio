@@ -199,6 +199,222 @@ Pyjo_Reactor_Trio trio
 200 Your Pyjo is working!
 ```
 
+`examples/echo_client_trio.py` is the echo client of the
+[tutorial of Trio](https://trio.readthedocs.io/en/stable/tutorial.html#an-echo-client),
+with its sender and receiver in a nursery, and an echo server of
+`Pyjo.IOLoop` in the same run of Trio. The sender waits for the echo of each
+message, and closes its side of the connection after the last one, which the
+server closes the connection at:
+
+```python
+import os
+
+
+# The reactor of Pyjoyment on Trio, selected before Pyjo.IOLoop is loaded
+os.environ['PYJO_REACTOR'] = 'Pyjo.Reactor.Trio'
+
+import Pyjo.IOLoop  # noqa: E402
+import Pyjo.Promise  # noqa: E402
+
+from itertools import count  # noqa: E402
+
+import trio  # noqa: E402
+
+
+MESSAGES = [b'async can sometimes be confusing,', b'but I believe in you!']
+
+CONNECTION_COUNTER = count()
+
+
+# The echo server of Pyjoyment, which writes back what it reads, until the client closes the connection
+def echo_server(closed):
+    def accept(loop, stream, id):
+        ident = next(CONNECTION_COUNTER)
+        print(f'echo_server {ident}: started')
+
+        @stream.on
+        def read(stream, data):
+            print(f'echo_server {ident}: received data {data!r}')
+            stream.write(data)
+
+        @stream.on
+        def close(stream):
+            print(f'echo_server {ident}: connection closed')
+            closed.resolve()
+
+    return Pyjo.IOLoop.server(accept, address='127.0.0.1')
+
+
+# The echo client of the tutorial of Trio, whose sender waits for the echo of each message before the next one and
+# closes its side of the connection after the last one, as the stream of Pyjoyment closes at the end of the data
+async def sender(client_stream, echoed):
+    print('sender: started!')
+    for data in MESSAGES:
+        print(f'sender: sending {data!r}')
+        await client_stream.send_all(data)
+        await echoed.receive()
+    await client_stream.send_eof()
+
+
+async def receiver(client_stream, echoed):
+    print('receiver: started!')
+    async for data in client_stream:
+        print(f'receiver: got data {data!r}')
+        await echoed.send(data)
+    print('receiver: connection closed')
+
+
+# The server of Pyjoyment in the run of Trio of the program, on a port that the system picks, and the client in a
+# nursery, until the server closed the connection, and the listen socket of the server removed at the end
+async def parent():
+    closed = Pyjo.Promise.new()
+    id = echo_server(closed)
+    port = Pyjo.IOLoop.acceptor(id).port
+    print(f'parent: connecting to 127.0.0.1:{port}')
+    client_stream = await trio.open_tcp_stream('127.0.0.1', port)
+    send_echoed, receive_echoed = trio.open_memory_channel(0)
+    async with client_stream, send_echoed, receive_echoed:
+        async with trio.open_nursery() as nursery:
+            print('parent: spawning sender...')
+            nursery.start_soon(sender, client_stream, receive_echoed)
+
+            print('parent: spawning receiver...')
+            nursery.start_soon(receiver, client_stream, send_echoed)
+    await closed
+    Pyjo.IOLoop.remove(id)
+
+
+trio.run(parent)
+```
+
+The tasks run concurrently, so the order of their lines differs between the
+runs:
+
+```console
+$ python examples/echo_client_trio.py
+parent: connecting to 127.0.0.1:60341
+parent: spawning sender...
+parent: spawning receiver...
+echo_server 0: started
+receiver: started!
+sender: started!
+sender: sending b'async can sometimes be confusing,'
+echo_server 0: received data b'async can sometimes be confusing,'
+receiver: got data b'async can sometimes be confusing,'
+sender: sending b'but I believe in you!'
+echo_server 0: received data b'but I believe in you!'
+receiver: got data b'but I believe in you!'
+echo_server 0: connection closed
+receiver: connection closed
+```
+
+`examples/echo_server_trio.py` is the echo server of the
+[tutorial of Trio](https://trio.readthedocs.io/en/stable/tutorial.html#an-echo-server),
+with `trio.serve_tcp` in a nursery, and an echo client of `Pyjo.IOLoop`, whose
+promise a task of Trio awaits:
+
+```python
+import os
+
+
+# The reactor of Pyjoyment on Trio, selected before Pyjo.IOLoop is loaded
+os.environ['PYJO_REACTOR'] = 'Pyjo.Reactor.Trio'
+
+import Pyjo.IOLoop  # noqa: E402
+import Pyjo.Promise  # noqa: E402
+
+from functools import partial  # noqa: E402
+from itertools import count  # noqa: E402
+
+import trio  # noqa: E402
+
+
+MESSAGES = [b'async can sometimes be confusing,', b'but I believe in you!']
+
+CONNECTION_COUNTER = count()
+
+
+# The echo server of the tutorial of Trio, until the client closes the connection
+async def echo_server(server_stream):
+    ident = next(CONNECTION_COUNTER)
+    print(f'echo_server {ident}: started')
+    try:
+        async for data in server_stream:
+            print(f'echo_server {ident}: received data {data!r}')
+            await server_stream.send_all(data)
+        print(f'echo_server {ident}: connection closed')
+    except Exception as exc:
+        print(f'echo_server {ident}: crashed: {exc!r}')
+
+
+# The echo client of Pyjoyment, which writes each message after the echo of the one before and closes the connection
+# after the last one, and its promise, which a task of Trio awaits
+def echo_client(port):
+    promise = Pyjo.Promise.new()
+    messages = list(MESSAGES)
+    echo = b''
+
+    @Pyjo.IOLoop.client(address='127.0.0.1', port=port)
+    def client(loop, err, stream):
+        if err is not None:
+            return promise.reject(err)
+
+        def send():
+            print(f'client: sending {messages[0]!r}')
+            stream.write(messages[0])
+
+        @stream.on
+        def read(stream, data):
+            nonlocal echo
+            echo += data
+            if len(echo) < len(messages[0]):
+                return
+            print(f'client: got data {echo!r}')
+            echo = b''
+            messages.pop(0)
+            if messages:
+                send()
+            else:
+                stream.close_gracefully()
+
+        @stream.on
+        def close(stream):
+            print('client: connection closed')
+            promise.resolve()
+
+        send()
+
+    return promise
+
+
+# The server of Trio in a nursery, on a port that the system picks, with its connections in a nursery of their own, so
+# that its listen socket closes after the client and the echo server ends with the connection
+async def main():
+    async with trio.open_nursery() as handler_nursery:
+        async with trio.open_nursery() as nursery:
+            listeners = await nursery.start(
+                partial(trio.serve_tcp, echo_server, 0, host='127.0.0.1', handler_nursery=handler_nursery)
+            )
+            await echo_client(listeners[0].socket.getsockname()[1])
+            nursery.cancel_scope.cancel()
+
+
+trio.run(main)
+```
+
+```console
+$ python examples/echo_server_trio.py
+echo_server 0: started
+client: sending b'async can sometimes be confusing,'
+echo_server 0: received data b'async can sometimes be confusing,'
+client: got data b'async can sometimes be confusing,'
+client: sending b'but I believe in you!'
+echo_server 0: received data b'but I believe in you!'
+client: got data b'but I believe in you!'
+client: connection closed
+echo_server 0: connection closed
+```
+
 ## Documentation
 
 The API of the module and the examples are on
