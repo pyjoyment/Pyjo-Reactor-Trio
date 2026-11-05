@@ -213,8 +213,14 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
             awaitable = reactor.awaitable(promise)
 
         Return what ``await promise`` waits on in a task of Trio, which
-        completes when the promise is fulfilled or rejected.
+        completes when the promise is fulfilled or rejected. Outside a task of
+        Trio, as in a coroutine that :mod:`Pyjo.Steps` drives, it is the one
+        of the base class, which yields the promise to whoever drives the
+        coroutine.
         """
+        # trio.Event().wait() outside a task raises RuntimeError in the coroutine, where an except of it would hide it
+        if not trio.lowlevel.in_trio_task():
+            return super().awaitable(promise)
         return _settled(promise)
 
     def close(self) -> None:
