@@ -653,6 +653,41 @@ with subtest('Watcher removed between the guest ticks'):
     first.close()
     peer.close()
 
+with subtest('Handle added while the own run ends'):
+    first, peer = socket.socketpair()
+    reactor = Pyjo.Reactor.Trio.new()
+    errors = []
+    readable = []
+
+    def readable_cb(reactor, writable):
+        readable.append(writable)
+        first.recv(1)
+        reactor.stop()
+
+    # A cleanup that the end of the run runs with run_sync_soon, after the system tasks, as _drain does
+    def add(hops=0):
+        if not trio._core._run.GLOBAL_RUN_CONTEXT.runner.system_nursery._closed and hops < 100:
+            trio.lowlevel.current_trio_token().run_sync_soon(add, hops + 1)
+            return
+        errors.append(eval_(lambda: reactor.io(first, readable_cb).watch(first, True, False)))
+
+    def rejected(reason):
+        trio.lowlevel.current_trio_token().run_sync_soon(add)
+
+    reactor.run_coroutine(trio.sleep_forever(), lambda value: None, rejected)
+    reactor.timer(0.01, lambda reactor: None)
+    reactor.one_tick()
+    reactor.close()
+    is_deeply_ok(errors, [None], 'handle added')
+    peer.sendall(b'x')
+    reactor.timer(5, lambda reactor: reactor.stop())
+    reactor.start()
+    is_deeply_ok(readable, [False], 'handle watched in the next run')
+    reactor.reset()
+    reactor.close()
+    first.close()
+    peer.close()
+
 with subtest('Finalizer in the frames of Trio'):
     got = []
 

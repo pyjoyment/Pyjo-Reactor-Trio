@@ -726,11 +726,11 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         args = (Pyjo_Reactor_Trio._watcher, ref, fd, writable, watcher)
         if fd in self._stopping and (run := self._run) is not None:
             try:
-                run.token.run_sync_soon(trio.lowlevel.spawn_system_task, *args)
+                run.token.run_sync_soon(_spawn_watcher, args)
                 return
             except trio.RunFinishedError:
                 return
-        trio.lowlevel.spawn_system_task(*args)
+        _spawn_watcher(args)
 
     def _watching(self) -> bool:
         return bool(len(self._timers) or len(self._io) or len(self._tasks))
@@ -822,6 +822,17 @@ class _Watcher:
     def __init__(self) -> None:
         self.scope = trio.CancelScope()
         self.stopped = False
+
+
+# A run that ends takes no more system tasks, where a handle is added by a cleanup that the end of the own run runs, as
+# _maybe_accepting of Pyjo.IOLoop, whose other acceptors would not start after the exception; the next run starts its
+# watcher, as it starts the watchers of all the handles
+def _spawn_watcher(args: tuple[Any, ...]) -> None:
+    try:
+        trio.lowlevel.spawn_system_task(*args)
+    except RuntimeError as e:
+        if 'closed to new arrivals' not in str(e):
+            raise
 
 
 def _in_task() -> bool:

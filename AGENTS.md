@@ -96,6 +96,16 @@ The docstring of the module says what a user sees; this is how and why.
   failed to start. A cleanup that is deferred runs in `_drain` of `_pump`,
   between the guest ticks, where the watcher that it removes is cancelled at
   the next tick, as above.
+- **Handles added while a run ends.** After the main task of a run, Trio
+  cancels the system tasks and closes their nursery, and still runs the
+  callbacks of `run_sync_soon`, as `_drain`, whose cleanups add handles, as
+  `_not_accepting()._maybe_accepting()` of `Pyjo.IOLoop` does.
+  `spawn_system_task` raises `RuntimeError` there, which `_drain` swallowed,
+  and `_maybe_accepting` stopped before the other acceptors: a server did not
+  accept a connection until the next change of the acceptors
+  (`t/Pyjo/App_ASGI.py`, WebSocket errors, about 1 of 10 runs on Linux).
+  `_spawn_watcher` leaves such a watcher to the next run, which starts the
+  watchers of all the handles.
 - **Closed handles and `notify_closing`.** The reactor does not call
   `trio.lowlevel.notify_closing`: Pyjoyment removes a handle before it closes
   it, and the cancellation of the watcher unregisters it at once. A handle
