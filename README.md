@@ -1,4 +1,4 @@
-[![Home](https://img.shields.io/badge/%F0%9F%8F%A0-Pyjoyment-02a7a0)](https://github.com/pyjoyment/Pyjoyment)
+[![Home](https://img.shields.io/badge/%F0%9F%8F%A0-Pyjoyment-02a7a0)](https://pyjoyment.dev/)
 [![GitHub](https://img.shields.io/github/stars/pyjoyment/Pyjo-Reactor-Trio?style=flat&label=GitHub%20%E2%AD%90&logo=github)](https://github.com/pyjoyment/Pyjo-Reactor-Trio)
 [![Documentation](https://img.shields.io/badge/docs-Read_the_Docs-blue?logo=readthedocs&logoColor=white)](https://pyjoyment.readthedocs.io/projects/pyjo-reactor-trio/en/stable/)
 [![License](https://img.shields.io/github/license/pyjoyment/Pyjo-Reactor-Trio.svg)](https://github.com/pyjoyment/Pyjo-Reactor-Trio/blob/main/LICENSE)
@@ -16,7 +16,7 @@
 </p>
 
 Low level event reactor with [Trio](https://trio.readthedocs.io) support for
-[Pyjoyment](https://github.com/pyjoyment/Pyjoyment).
+[Pyjoyment](https://pyjoyment.dev/).
 
 `Pyjo.Reactor.Trio` is a reactor of Pyjoyment on Trio, the async library of
 structured concurrency, so that the servers of Pyjoyment, `daemon`, `prefork`
