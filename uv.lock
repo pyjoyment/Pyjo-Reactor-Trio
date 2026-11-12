@@ -427,7 +427,7 @@ docs = ">=3.14"
 
 [package.metadata]
 requires-dist = [
-    { name = "pyjoyment", git = "https://github.com/pyjoyment/Pyjoyment?branch=cancel-actions" },
+    { name = "pyjoyment", git = "https://github.com/pyjoyment/Pyjoyment?branch=main" },
     { name = "trio", specifier = ">=0.35.0" },
 ]
 
@@ -437,7 +437,7 @@ docs = [{ name = "sphinx", marker = "python_full_version >= '3.14'", specifier =
 [[package]]
 name = "pyjoyment"
 version = "0.3.1.dev1"
-source = { git = "https://github.com/pyjoyment/Pyjoyment?branch=cancel-actions#64a90428c6318ae1d49ddc1239dc1a9fd380b27f" }
+source = { git = "https://github.com/pyjoyment/Pyjoyment?branch=main#e1842dbe1068121a1887dad88d3d6b3bcb3bca96" }
 
 [[package]]
 name = "requests"
