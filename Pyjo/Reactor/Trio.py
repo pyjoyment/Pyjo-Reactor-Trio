@@ -342,10 +342,10 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
     # Not in Mojolicious: a task of the run of Trio
     def run_coroutine(
         self, coro: Coroutine[Any, Any, Any], resolve: Callable[[Any], Any], reject: Callable[[Any], Any]
-    ) -> None:
+    ) -> Callable[[], None]:
         """::
 
-            reactor.run_coroutine(coro, resolve, reject)
+            cancel = reactor.run_coroutine(coro, resolve, reject)
 
         Run a coroutine as a task of the run of Trio, where it can await
         anything of Trio, and call ``resolve`` with what it returns or
@@ -353,7 +353,9 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         :class:`trio.Cancelled` when the run ends before it. A coroutine that
         is not done is something to watch, so that :meth:`start` does not stop
         before it, and each step of the coroutine is an event, which ends
-        :meth:`one_tick`.
+        :meth:`one_tick`. It returns a function that cancels the task, with a
+        cancel scope of its own, whose coroutine gets :class:`trio.Cancelled`
+        where it waits, and whose promise that it waits for is cancelled.
         """
         if self._bind() is None:
             self._own()
@@ -362,25 +364,42 @@ class Pyjo_Reactor_Trio(Pyjo.Reactor.Poll.object):
         ref = weakref.ref[Pyjo_Reactor_Trio](self)
         step = weakref.WeakMethod(self._step)
 
+        # The scope of the cancellation of the task alone, which takes its own trio.Cancelled, and not the one of the end
+        # of the run
+        scope = trio.CancelScope()
+
         async def task() -> None:
-            try:
-                result = await _Steps(coro, step)
-            except (Exception, trio.Cancelled) as e:
-                if (reactor := ref()) is not None:
-                    reactor._tasks.discard(token)
-                reject(e)
-                if isinstance(e, trio.Cancelled):
+            with scope:
+                try:
+                    result = await _Steps(coro, step)
+                except (Exception, trio.Cancelled) as e:
+                    if (reactor := ref()) is not None:
+                        reactor._tasks.discard(token)
+                    reject(e)
+                    if isinstance(e, trio.Cancelled):
+                        raise
+                    return
+                except BaseException:
+                    if (reactor := ref()) is not None:
+                        reactor._tasks.discard(token)
                     raise
-                return
-            except BaseException:
                 if (reactor := ref()) is not None:
                     reactor._tasks.discard(token)
-                raise
-            if (reactor := ref()) is not None:
-                reactor._tasks.discard(token)
-            resolve(result)
+                resolve(result)
 
         trio.lowlevel.spawn_system_task(task)
+
+        # In a task of the run, or at its next tick elsewhere, as between the guest ticks of the own run
+        def cancel() -> None:
+            if (reactor := ref()) is None or (run := reactor._run) is None or run.done or _in_task():
+                scope.cancel()
+                return
+            try:
+                run.token.run_sync_soon(scope.cancel)
+            except trio.RunFinishedError:
+                scope.cancel()
+
+        return cancel
 
     def start(self) -> None:
         """::
@@ -859,7 +878,13 @@ def _fileno(handle: Handle) -> int:
 async def _settled(promise: Any) -> None:
     event = trio.Event()
     promise.then(lambda *values: event.set(), lambda *values: event.set())  # pyright: ignore[reportUnknownLambdaType]
-    await event.wait()
+    try:
+        await event.wait()
+    except trio.Cancelled:
+        # The promise of a task that is cancelled while it waits, which nothing waits for anymore
+        if callable(cancel := getattr(promise, 'cancel', None)):
+            cancel()
+        raise
 
 
 # A coroutine of Pyjoyment, whose steps are events of the reactor, as one_tick returns after one
