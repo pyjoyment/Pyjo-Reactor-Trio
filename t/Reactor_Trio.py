@@ -555,6 +555,41 @@ with subtest('Coroutines of the own run'):
     ok(reactor._run is None, 'run ended')
     is_ok(trio.run(trio.sleep, 0), None, 'thread can run Trio again')
 
+# Not in Mojolicious: the cancellation of a coroutine where it waits, with the promise that it waits for, in a run of
+# Trio and in the own run of the reactor
+with subtest('Cancellation of a coroutine'):
+    import Pyjo.Promise
+
+    got = []
+
+    def waiting():
+        return Pyjo.Promise.new(cancel=lambda: got.append('promise cancelled'))
+
+    async def coroutine(promise):
+        try:
+            await promise
+        finally:
+            got.append('finally')
+
+    async def application():
+        reactor = Pyjo.Reactor.Trio.new()
+        cancel = reactor.run_coroutine(coroutine(waiting()), got.append, lambda reason: got.append(type(reason)))
+        await trio.sleep(0.01)
+        cancel()
+        await trio.sleep(0.01)
+        cancel()
+
+    trio.run(application)
+    is_deeply_ok(got, ['promise cancelled', 'finally', trio.Cancelled], 'in a run of Trio')
+
+    got.clear()
+    reactor = Pyjo.Reactor.Trio.new()
+    cancel = reactor.run_coroutine(coroutine(waiting()), got.append, lambda reason: got.append(type(reason)))
+    reactor.timer(0.01, lambda reactor: cancel())
+    reactor.start()
+    is_deeply_ok(got, ['promise cancelled', 'finally', trio.Cancelled], 'in the own run, between its guest ticks')
+    reactor.close()
+
 with subtest('Order of the events'):
     orders = []
     for i in range(20):
